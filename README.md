@@ -1,7 +1,7 @@
 # llama.cpp
 
 > [!IMPORTANT]
-> **SenseNova-Loop build.** This fork runs the [SenseNova-Loop-9B-Preview](https://huggingface.co/sensenova/SenseNova-Loop-9B-Preview) GGUF files, which stock llama.cpp cannot load. Windows x64 packages with `llama-server.exe`, all the DLLs and the CUDA 12 runtime:
+> **SenseNova-Loop build.** This fork runs the [SenseNova-Loop-9B-Preview](https://huggingface.co/sensenova/SenseNova-Loop-9B-Preview) GGUF files (Text only), which stock llama.cpp cannot load. Windows x64 packages with `llama-server.exe`, all the DLLs and the CUDA 12 runtime:
 >
 > - [**llama-eb039c2-bin-win-cuda-12.4-x64.zip**](https://github.com/terasut-num/llama.cpp/releases/download/sensenova-loop-eb039c2/llama-eb039c2-bin-win-cuda-12.4-x64.zip): GTX 900 series to RTX 40 series, NVIDIA driver R550 or newer
 > - [**llama-eb039c2-bin-win-cuda-12.8-x64.zip**](https://github.com/terasut-num/llama.cpp/releases/download/sensenova-loop-eb039c2/llama-eb039c2-bin-win-cuda-12.8-x64.zip): RTX 50 series, NVIDIA driver R570 or newer
