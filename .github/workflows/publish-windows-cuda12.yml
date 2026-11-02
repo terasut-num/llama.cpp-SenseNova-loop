@@ -1,0 +1,76 @@
+name: Publish Windows CUDA 12 package
+
+# Puts the packages of a "Build Windows CUDA 12 package" run on a GitHub release, tagged at the commit they
+# were built from.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'ID of the "Build Windows CUDA 12 package" run'
+        required: true
+        type: string
+      tag:
+        description: 'Release tag'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download the packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: llama-*-bin-win-cuda-*
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: pkg
+
+      - name: Zip
+        run: |
+          cd pkg
+          for d in */; do
+            (cd "$d" && zip -qr "../${d%/}.zip" .)
+          done
+          ls -la
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          sha=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq .head_sha)
+          {
+            echo "Windows x64 build of \`llama-server.exe\` and the other tools with the CUDA 12 backend, built from ${sha} ([build run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID})). Each zip holds the executables, all the DLLs they load and the CUDA runtime DLLs."
+            echo
+            for f in pkg/*.zip; do
+              name=$(basename "$f")
+              case "$name" in
+                *cuda-12.4*) echo "- \`${name}\`: GTX 900 series to RTX 40 series, NVIDIA driver R550 or newer" ;;
+                *cuda-12.8*) echo "- \`${name}\`: RTX 50 series, NVIDIA driver R570 or newer" ;;
+                *)           echo "- \`${name}\`" ;;
+              esac
+            done
+            echo
+            echo "Unzip into one folder and run:"
+            echo
+            echo '```'
+            echo 'llama-server.exe -m SenseNova-Loop-9B-Preview-Q4_K_M.gguf -ngl 99 -c 16384 --port 8080'
+            echo '```'
+            echo
+            echo "Supported GGUF files and details: [docs/sensenova-loop.md](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${sha}/docs/sensenova-loop.md)"
+          } > notes.md
+          cat notes.md
+          gh release create "$TAG" pkg/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$sha" \
+            --title "SenseNova-Loop for Windows, CUDA 12 (${sha::7})" \
+            --notes-file notes.md \
+            --latest

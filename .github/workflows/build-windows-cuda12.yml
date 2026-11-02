@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - claude/upbeat-cray-7vtuvh
+      - master
     paths:
       - '.github/workflows/build-windows-cuda12.yml'
       - '.github/actions/windows-setup-cuda/**'

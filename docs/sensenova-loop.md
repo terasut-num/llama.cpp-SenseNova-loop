@@ -21,12 +21,14 @@ python convert_hf_to_gguf.py /path/to/SenseNova-Loop-9B-Preview --outtype bf16 -
 
 ## Windows CUDA 12 build
 
-The workflow [build-windows-cuda12.yml](../.github/workflows/build-windows-cuda12.yml) runs on every push to this branch and can be started by hand from the Actions tab. Each run uploads one artifact per CUDA version, with `llama-server.exe`, the other tools, all the DLLs they load (`llama.dll`, `ggml*.dll`, `ggml-cuda.dll`, ...) and the CUDA runtime (`cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`):
+Ready-made packages are on the [releases page](https://github.com/terasut-num/llama.cpp/releases). The workflow [build-windows-cuda12.yml](../.github/workflows/build-windows-cuda12.yml) builds them on every push to `master` that changes the code, and can be started by hand from the Actions tab. Each run uploads one artifact per CUDA version, with `llama-server.exe`, the other tools, all the DLLs they load (`llama.dll`, `ggml*.dll`, `ggml-cuda.dll`, ...) and the CUDA runtime (`cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`):
 
 - `llama-<commit>-bin-win-cuda-12.4-x64`: same CUDA version as the upstream release, needs driver R550 or newer. An RTX 50 series GPU runs it through PTX JIT, which makes the first start slow.
 - `llama-<commit>-bin-win-cuda-12.8-x64`: adds native code for the RTX 50 series, needs driver R570 or newer.
 
-Unzip the artifact into one folder and run:
+To put the packages of a build run on a release, start [publish-windows-cuda12.yml](../.github/workflows/publish-windows-cuda12.yml) from the Actions tab with the ID of the run and a new tag.
+
+Unzip a package into one folder and run:
 
 ```bash
 llama-server.exe -m SenseNova-Loop-9B-Preview-Q4_K_M.gguf -ngl 99 -c 16384 --port 8080
