@@ -318,6 +318,7 @@ class Keys:
     class MHC:
         STREAMS        = "{arch}.mhc.streams"
         LAYER_KINDS    = "{arch}.mhc.layer_kinds"
+        PRE_SCALE      = "{arch}.mhc.pre_scale"
 
     class SSM:
         CONV_KERNEL    = "{arch}.ssm.conv_kernel"
@@ -3314,7 +3315,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HNORM,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
-            MODEL_TENSOR.MHC_ATTN_W,
+        MODEL_TENSOR.MHC_ATTN_W,
         MODEL_TENSOR.MHC_ATTN_B,
         MODEL_TENSOR.MHC_FFN_W,
         MODEL_TENSOR.MHC_FFN_B,

@@ -1,33 +1,20 @@
-"""SenseNova-Loop: a Qwen3.5 hybrid trunk with a repeated block and per-sublayer residual routers.
+"""SenseNova-Loop: a Qwen3.5 hybrid trunk that runs its middle layers several times, with two residual
+streams and a mHC router on each sublayer of the looped layers.
 
-Two facts drive this converter.
-
-The loop (`loop_settings`) runs the physical layers `start..end-1` `count` times with shared weights.
-llama.cpp has no notion of a layer execution plan, so the loop is expanded here: every visit becomes
-its own block in the file, with its own recurrent state and KV slots. The arithmetic is identical,
-because each visit is the same weights applied to a fresh state. Cost is file size, not correctness:
-24 of 32 layers are stored twice.
-
-The mHC routers (`mhc`) are per-sublayer, not per-layer: `mhc_attn` and `mhc_ffn` each own an fp32
-projection of width 2*streams*dim -> 2*streams + streams^2, and the sublayer runs once on the
-pre-weighted sum of the residual streams. Those tensors go into the file untouched and stay fp32.
-
+The file has one block per layer visit, so each visit gets its own KV cache and recurrent state. Only the
+first visit of a layer stores tensors, the loader reuses them for the later visits. The routers stay F32.
 Vision and the MTP head are dropped: this GGUF is text-only.
 """
 
 from __future__ import annotations
 
 import re
-import sys
-from pathlib import Path
 from typing import Iterable
 
 import torch
 from torch import Tensor
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-import gguf
-from . import ModelBase, logger
+from .base import ModelBase, gguf, logger
 from .qwen import Qwen3_5TextModel
 
 
@@ -53,7 +40,10 @@ def mhc_kinds(plan: list[int], mhc: dict | None) -> list[int]:
     if not mhc:
         return kinds
     lo, hi = int(mhc["start"]), int(mhc["end"])
-    inside = lambda p: p is not None and lo <= p < hi
+
+    def inside(p: int | None) -> bool:
+        return p is not None and lo <= p < hi
+
     for v, p in enumerate(plan):
         if not inside(p):
             continue
@@ -77,8 +67,6 @@ class SenseNovaLoopModel(Qwen3_5TextModel):
         mhc = self.hparams.get("mhc")
         n_phys = int(self.hparams["num_hidden_layers"])
 
-        if mhc and float(mhc.get("pre_scale", 1.0)) != 1.0:
-            raise ValueError("mHC pre_scale is not 1.0; the graph would need it baked in")
         if mhc and mhc.get("fixed_identity"):
             raise ValueError("mHC fixed_identity is set; the mixing matrix would be the identity")
 
@@ -114,9 +102,22 @@ class SenseNovaLoopModel(Qwen3_5TextModel):
         if self.mhc:
             arch = self.gguf_writer.arch
             streams = int(self.mhc["streams"])
+            iterations = int(self.mhc["iterations"])
+            pre_scale = float(self.mhc.get("pre_scale", 1.0))
             self.gguf_writer.add_uint32(gguf.Keys.MHC.STREAMS.format(arch=arch), streams)
             self.gguf_writer.add_array(gguf.Keys.MHC.LAYER_KINDS.format(arch=arch), self.kinds)
-            logger.info(f"mHC: {streams} streams, {int(self.mhc['iterations'])} sinkhorn iterations")
+            self.gguf_writer.add_hyper_connection_sinkhorn_iterations(iterations)
+            if pre_scale != 1.0:
+                self.gguf_writer.add_float32(gguf.Keys.MHC.PRE_SCALE.format(arch=arch), pre_scale)
+            logger.info(f"mHC: {streams} streams, {iterations} sinkhorn iterations, pre_scale {pre_scale}")
+
+    def _tensor_requires_f32(self, new_name: str, bid: int | None, n_dims: int) -> bool:
+        # the routers run in fp32, as in the reference
+        if ".mhc_attn." in new_name or ".mhc_ffn." in new_name:
+            return True
+        # bid is the layer of the source tensor, the tensor is written under its block
+        m = re.match(r"blk\.(\d+)\.", new_name)
+        return super()._tensor_requires_f32(new_name, int(m.group(1)) if m else bid, n_dims)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name.startswith("model.visual.") or name.startswith("mtp."):
