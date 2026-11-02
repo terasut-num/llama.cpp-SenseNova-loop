@@ -1,0 +1,192 @@
+name: Build Windows CUDA 12 package
+
+# Windows x64 build of llama-server and the other tools with the CUDA 12 backend, made the same way as
+# the upstream release: the tools and the CPU backends with clang, ggml-cuda.dll with MSVC and nvcc.
+# Each package is one folder with the executables, all the DLLs they load and the CUDA runtime DLLs.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/upbeat-cray-7vtuvh
+    paths:
+      - '.github/workflows/build-windows-cuda12.yml'
+      - '.github/actions/windows-setup-cuda/**'
+      - '**/CMakeLists.txt'
+      - '**/*.cmake'
+      - '**/*.h'
+      - '**/*.hpp'
+      - '**/*.c'
+      - '**/*.cpp'
+      - '**/*.cu'
+      - '**/*.cuh'
+      - '**/*.comp'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  ui:
+    uses: ./.github/workflows/ui-build.yml
+
+  cpu:
+    name: tools + CPU backends
+    needs: ui
+    runs-on: windows-2025
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download UI build
+        uses: actions/download-artifact@v8
+        with:
+          name: llama-ui.zip
+          path: tools/ui/dist
+
+      - name: Install Ninja
+        run: |
+          choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: windows-cuda12-package-cpu-x64
+          evict-old-files: 1d
+
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+          call "%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON
+          cmake --build build --config Release
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-cpu-x64
+          path: build/bin/Release/
+          retention-days: 3
+
+  cuda:
+    name: ggml-cuda (CUDA ${{ matrix.cuda }})
+    runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 12.4 runs on the widest range of drivers, 12.8 adds native RTX 50 series (sm_120) code
+        cuda: ['12.4', '12.8']
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: |
+          choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: windows-cuda12-package-cuda-${{ matrix.cuda }}-x64
+          evict-old-files: 1d
+
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+          call "%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Collect ggml-cuda and the CUDA runtime
+        run: |
+          $dst = New-Item -ItemType Directory -Force -Path pkg
+          Copy-Item .\build\bin\Release\ggml-cuda.dll $dst
+          foreach ($dir in 'bin', 'bin\x64', 'lib') {
+            $src = Join-Path $env:CUDA_PATH $dir
+            if (Test-Path $src) {
+              Get-ChildItem -Path $src -File | Where-Object { $_.Name -match '^(cudart64|cublas64|cublasLt64)_\d+\.dll$' } | Copy-Item -Destination $dst -Force
+            }
+          }
+          Get-ChildItem $dst
+          foreach ($dll in 'ggml-cuda.dll', 'cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll') {
+            if (-not (Test-Path (Join-Path $dst $dll))) {
+              throw "missing $dll"
+            }
+          }
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-cuda-${{ matrix.cuda }}-x64
+          path: pkg/
+          retention-days: 3
+
+  package:
+    name: package (CUDA ${{ matrix.cuda }})
+    needs: [cpu, cuda]
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ['12.4', '12.8']
+
+    steps:
+      - name: Download the tools and CPU backends
+        uses: actions/download-artifact@v8
+        with:
+          name: win-cpu-x64
+          path: dist
+
+      - name: Download ggml-cuda and the CUDA runtime
+        uses: actions/download-artifact@v8
+        with:
+          name: win-cuda-${{ matrix.cuda }}-x64
+          path: dist
+
+      - name: Check
+        id: check
+        run: |
+          ls -la dist
+          for f in llama-server.exe llama-cli.exe llama.dll ggml.dll ggml-base.dll ggml-cuda.dll cudart64_12.dll cublas64_12.dll cublasLt64_12.dll; do
+            test -f "dist/$f" || { echo "missing $f"; exit 1; }
+          done
+          ls dist/ggml-cpu-*.dll
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-${{ steps.check.outputs.sha }}-bin-win-cuda-${{ matrix.cuda }}-x64
+          path: dist/
