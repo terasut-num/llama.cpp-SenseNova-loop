@@ -18,7 +18,7 @@ from .base import ModelBase, gguf, logger
 from .qwen import Qwen3_5TextModel
 
 
-def execution_plan(loop: dict, n_phys: int) -> list[int]:
+def execution_plan(loop: dict | None, n_phys: int) -> list[int]:
     """Physical layer order for one token, exactly as their `execution_plan` builds it."""
     if not isinstance(loop, dict):
         raise ValueError("loop_settings must be a mapping")
@@ -41,16 +41,16 @@ def mhc_kinds(plan: list[int], mhc: dict | None) -> list[int]:
         return kinds
     lo, hi = int(mhc["start"]), int(mhc["end"])
 
-    def inside(p: int | None) -> bool:
-        return p is not None and lo <= p < hi
+    def inside(p: int) -> bool:
+        return lo <= p < hi
 
     for v, p in enumerate(plan):
         if not inside(p):
             continue
         prev_p = plan[v - 1] if v > 0 else None
         next_p = plan[v + 1] if v + 1 < len(plan) else None
-        enters = not inside(prev_p) or p <= prev_p          # first visit of a pass
-        leaves = not inside(next_p) or next_p <= p          # last visit of a pass
+        enters = prev_p is None or not inside(prev_p) or p <= prev_p  # first visit of a pass
+        leaves = next_p is None or not inside(next_p) or next_p <= p  # last visit of a pass
         kinds[v] = 3 if (enters and leaves) else 1 if enters else 2 if leaves else 4
     return kinds
 
