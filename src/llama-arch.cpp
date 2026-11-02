@@ -1425,6 +1425,7 @@ bool llama_arch_supports_save(llm_arch arch) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_CLEF: // the head tensors are not saved
         case LLM_ARCH_VLLM_DECISION2:
+        case LLM_ARCH_SENSENOVA_LOOP: // the loop keys are not saved and repeated visits share tensors
             return false;
         default:
             return true;
