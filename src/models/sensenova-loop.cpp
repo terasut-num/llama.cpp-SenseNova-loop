@@ -231,7 +231,7 @@ llama_model_sensenova_loop::graph::graph(const llama_model & model, const llm_gr
                                   ggml_tensor ** out_a, ggml_tensor ** out_b) {
         const int64_t d = a->ne[0];
 
-        ggml_tensor * packed = ggml_mhc_route(ctx0, a, b, w, bias);
+        ggml_tensor * packed = ggml_mhc_route(ctx0, a, b, w, bias, 20);
         cb(packed, is_attn ? "mhc_attn_packed" : "mhc_ffn_packed", il);
 
         ggml_tensor * branch = ggml_view_3d(ctx0, packed, d, packed->ne[1], packed->ne[2],

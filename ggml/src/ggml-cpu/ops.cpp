@@ -12511,17 +12511,8 @@ void ggml_compute_forward_lightning_indexer(
     }
 }
 
-// ---- sense nova loop: fused residual stream routers ----
-// sense nova loop residual stream routers, fused.
-//
-// The router is small but fiddly: an RMS norm over the two streams flattened together, eight
-// logits, two gates per stream, a gate per stream for the sublayer output, and a 2x2 mixing
-// matrix that twenty sinkhorn passes of row-then-column normalisation (in log space) turn into a
-// doubly stochastic one. Ninety six of those per token is a mountain of tiny graph nodes, so the
-// whole thing lives here as a single op.
-//
-// Inputs may be views (the streams come out of the merge op as two halves of one buffer), so rows
-// are addressed through nb[1] and nb[2]; elements inside a row are unit stride.
+// SenseNova-Loop mHC router and merge, see ggml_mhc_route and ggml_mhc_merge
+// the inputs may be views (the streams are the two halves of the merge output), so rows use nb[1] and nb[2]
 
 void ggml_compute_forward_mhc_route(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     const struct ggml_tensor * a    = dst->src[0];
@@ -12546,7 +12537,7 @@ void ggml_compute_forward_mhc_route(const struct ggml_compute_params * params, s
     const float * pbias = (const float *) bias->data;
     float       * out   = (float *) dst->data;
 
-    const int sink_iters = 20;
+    const int sink_iters = ggml_get_op_params_i32(dst, 0);
 
     for (int64_t s = 0; s < n_str; ++s) {
         for (int64_t t = params->ith; t < n_tok; t += params->nth) {
@@ -12613,14 +12604,14 @@ void ggml_compute_forward_mhc_merge(const struct ggml_compute_params * params, s
     GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
     GGML_ASSERT(x->type == GGML_TYPE_F32 && packed->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(dst));
-    GGML_ASSERT(a->nb[0] == sizeof(float) && x->nb[0] == sizeof(float) && packed->nb[0] == sizeof(float));
+    GGML_ASSERT(a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float));
+    GGML_ASSERT(x->nb[0] == sizeof(float) && packed->nb[0] == sizeof(float));
 
     const int64_t d     = a->ne[0];
     const int64_t n_tok = a->ne[1];
     const int64_t n_str = a->ne[2];
 
-    const float * pp  = (const float *) packed->data;
-    float       * out = (float *) dst->data;
+    float * out = (float *) dst->data;
 
     for (int64_t s = 0; s < n_str; ++s) {
         for (int64_t t = params->ith; t < n_tok; t += params->nth) {
@@ -12646,6 +12637,4 @@ void ggml_compute_forward_mhc_merge(const struct ggml_compute_params * params, s
             }
         }
     }
-
-    GGML_UNUSED(pp);
 }

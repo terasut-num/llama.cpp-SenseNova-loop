@@ -2550,14 +2550,24 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
-    // sense nova loop: residual stream router and stream merge (fused, two streams)
+    // SenseNova-Loop mHC router for two residual streams (fused)
+    //
+    // a, b: the two streams [d, n_tokens, n]
+    // w:    [2*d, 8] router weights, bias: [8]
+    //   logits = w*rms_norm(concat(a, b)) + bias
+    //   pre    = sigmoid(logits[0..1]), post = 2*sigmoid(logits[2..3])
+    //   mix    = sinkhorn(logits[4..7] as 2x2 row-major, n_iter passes in log space)
+    // result: [d + 6, n_tokens, n] = pre[0]*a + pre[1]*b, followed by post[0], post[1], mix[0][0], mix[0][1], mix[1][0], mix[1][1]
     GGML_API struct ggml_tensor * ggml_mhc_route(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             struct ggml_tensor  * w,
-            struct ggml_tensor  * bias);
+            struct ggml_tensor  * bias,
+            int                   n_iter);
 
+    // SenseNova-Loop mHC merge: x is the sublayer output [d, n_tokens, n], packed is the ggml_mhc_route result
+    // result: [2*d, n_tokens, n] = concat(mix[0][0]*a + mix[0][1]*b + post[0]*x, mix[1][0]*a + mix[1][1]*b + post[1]*x)
     GGML_API struct ggml_tensor * ggml_mhc_merge(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

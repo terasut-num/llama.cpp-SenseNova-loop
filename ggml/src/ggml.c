@@ -5759,7 +5759,8 @@ struct ggml_tensor * ggml_mhc_route(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         struct ggml_tensor  * w,
-        struct ggml_tensor  * bias) {
+        struct ggml_tensor  * bias,
+        int                   n_iter) {
     GGML_ASSERT(a->nb[0] == sizeof(float));
     GGML_ASSERT(b->nb[0] == sizeof(float));
     GGML_ASSERT(a->type == GGML_TYPE_F32);
@@ -5767,13 +5768,17 @@ struct ggml_tensor * ggml_mhc_route(
     GGML_ASSERT(w->type == GGML_TYPE_F32);
     GGML_ASSERT(bias->type == GGML_TYPE_F32);
     GGML_ASSERT(a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] && a->ne[2] == b->ne[2]);
+    GGML_ASSERT(a->ne[3] == 1 && b->ne[3] == 1);
     GGML_ASSERT(w->ne[0] == 2*a->ne[0]);
     GGML_ASSERT(w->ne[1] == 8);
     GGML_ASSERT(bias->ne[0] == 8);
+    GGML_ASSERT(n_iter >= 1);
 
     const int64_t d = a->ne[0];
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d + 6, a->ne[1], a->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, n_iter);
 
     result->op     = GGML_OP_MHC_ROUTE;
     result->src[0] = a;
@@ -5797,7 +5802,9 @@ struct ggml_tensor * ggml_mhc_merge(
     GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
     GGML_ASSERT(x->type == GGML_TYPE_F32 && packed->type == GGML_TYPE_F32);
     GGML_ASSERT(a->ne[0] == b->ne[0] && a->ne[0] == x->ne[0]);
+    GGML_ASSERT(a->ne[1] == b->ne[1] && a->ne[2] == b->ne[2]);
     GGML_ASSERT(a->ne[1] == x->ne[1] && a->ne[2] == x->ne[2]);
+    GGML_ASSERT(a->ne[3] == 1 && b->ne[3] == 1 && x->ne[3] == 1);
     GGML_ASSERT(packed->ne[0] == a->ne[0] + 6);
     GGML_ASSERT(packed->ne[1] == a->ne[1] && packed->ne[2] == a->ne[2]);
 

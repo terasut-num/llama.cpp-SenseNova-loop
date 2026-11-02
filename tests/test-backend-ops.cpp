@@ -4719,6 +4719,104 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// GGML_OP_MHC_ROUTE
+struct test_mhc_route : public test_case {
+    const int64_t d;
+    const int64_t n_tokens;
+    const int64_t n_seq;
+    const int     n_iter;
+    const int     layout; // 0: separate streams, 1: halves of one tensor, 2: both streams are the same tensor
+
+    std::string vars() override {
+        return VARS_TO_STR5(d, n_tokens, n_seq, n_iter, layout);
+    }
+
+    test_mhc_route(int64_t d = 64, int64_t n_tokens = 7, int64_t n_seq = 1, int n_iter = 20, int layout = 0)
+        : d(d), n_tokens(n_tokens), n_seq(n_seq), n_iter(n_iter), layout(layout) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = nullptr;
+        ggml_tensor * b = nullptr;
+        if (layout == 1) {
+            ggml_tensor * ab = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*d, n_tokens, n_seq);
+            ggml_set_name(ab, "ab");
+            a = ggml_view_3d(ctx, ab, d, n_tokens, n_seq, ab->nb[1], ab->nb[2], 0);
+            b = ggml_view_3d(ctx, ab, d, n_tokens, n_seq, ab->nb[1], ab->nb[2], d*ab->nb[0]);
+        } else {
+            a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_tokens, n_seq);
+            ggml_set_name(a, "a");
+            b = a;
+            if (layout == 0) {
+                b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_tokens, n_seq);
+                ggml_set_name(b, "b");
+            }
+        }
+
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*d, 8);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+        ggml_set_name(bias, "bias");
+
+        ggml_tensor * out = ggml_mhc_route(ctx, a, b, w, bias, n_iter);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "w") == 0) {
+                // keep the logits in the non-saturated range of the gates
+                const float r = 2.0f/sqrtf((float) (2*d));
+                init_tensor_uniform(t, -r, r);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_MHC_MERGE
+struct test_mhc_merge : public test_case {
+    const int64_t d;
+    const int64_t n_tokens;
+    const int64_t n_seq;
+    const bool    halves; // streams are the two halves of one tensor
+
+    std::string vars() override {
+        return VARS_TO_STR4(d, n_tokens, n_seq, halves);
+    }
+
+    test_mhc_merge(int64_t d = 64, int64_t n_tokens = 7, int64_t n_seq = 1, bool halves = false)
+        : d(d), n_tokens(n_tokens), n_seq(n_seq), halves(halves) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = nullptr;
+        ggml_tensor * b = nullptr;
+        if (halves) {
+            ggml_tensor * ab = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*d, n_tokens, n_seq);
+            ggml_set_name(ab, "ab");
+            a = ggml_view_3d(ctx, ab, d, n_tokens, n_seq, ab->nb[1], ab->nb[2], 0);
+            b = ggml_view_3d(ctx, ab, d, n_tokens, n_seq, ab->nb[1], ab->nb[2], d*ab->nb[0]);
+        } else {
+            a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_tokens, n_seq);
+            ggml_set_name(a, "a");
+            b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_tokens, n_seq);
+            ggml_set_name(b, "b");
+        }
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_tokens, n_seq);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * packed = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d + 6, n_tokens, n_seq);
+        ggml_set_name(packed, "packed");
+
+        ggml_tensor * out = ggml_mhc_merge(ctx, a, b, x, packed);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -10138,6 +10236,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+
+    for (int layout : {0, 1, 2}) {
+        test_cases.emplace_back(new test_mhc_route(1, 1, 1, 20, layout));
+        test_cases.emplace_back(new test_mhc_route(64, 7, 1, 20, layout));
+        test_cases.emplace_back(new test_mhc_route(300, 33, 3, 20, layout));
+        test_cases.emplace_back(new test_mhc_route(4096, 1, 1, 20, layout));
+        test_cases.emplace_back(new test_mhc_route(4096, 19, 1, 20, layout));
+    }
+    test_cases.emplace_back(new test_mhc_route(64, 7, 1, 1));
+    test_cases.emplace_back(new test_mhc_route(64, 7, 1, 7));
+    for (bool halves : {false, true}) {
+        test_cases.emplace_back(new test_mhc_merge(1, 1, 1, halves));
+        test_cases.emplace_back(new test_mhc_merge(64, 7, 1, halves));
+        test_cases.emplace_back(new test_mhc_merge(300, 33, 3, halves));
+        test_cases.emplace_back(new test_mhc_merge(4096, 19, 1, halves));
+    }
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)

@@ -16198,7 +16198,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
-                return true;
+                // the route shader runs a fixed 20 sinkhorn passes and reads the gates of the first stream batch only
+                return op->op != GGML_OP_MHC_ROUTE || (ggml_get_op_params_i32(op, 0) == 20 && op->src[0]->ne[2] == 1);
             }
 
         case GGML_OP_CONV_TRANSPOSE_1D:
