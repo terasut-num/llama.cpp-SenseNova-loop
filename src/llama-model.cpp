@@ -401,6 +401,12 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
     }
 
+    // some SenseNova-Loop conversions are tagged qwen35 and carry the loop in extra keys
+    uint32_t loop_start = 0;
+    if (arch == LLM_ARCH_QWEN35 && ml.get_key(LLM_KV_LOOP_START, loop_start, false)) {
+        arch = LLM_ARCH_SENSENOVA_LOOP;
+    }
+
     return llama_model_create(arch, params);
 }
 
@@ -2409,14 +2415,6 @@ void llama_model_base::load_tensors_hadamard() {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    // A re-entered loop block owns no weights of its own: every one of its tensors is the first
-    // visit's tensor, byte for byte. Sharing the pointer here instead of loading a second copy
-    // needs the loader's tensor list to dedupe as well, otherwise the buffer is sized for both
-    // copies and the VRAM saving never appears. Until that lands, load the duplicate.
-    return create_tensor_impl(ml, tn, ne, flags);
-}
-
-ggml_tensor * llama_model_base::create_tensor_impl(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = nullptr;
     if (tn.bid != -1) {
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
@@ -2611,6 +2609,7 @@ void llama_model::print_info() const {
                 arch == LLM_ARCH_QWEN3NEXT ||
                 arch == LLM_ARCH_QWEN35 ||
                 arch == LLM_ARCH_QWEN35MOE ||
+                arch == LLM_ARCH_SENSENOVA_LOOP ||
                 arch == LLM_ARCH_NEMOTRON_H ||
                 arch == LLM_ARCH_NEMOTRON_H_MOE) {
             LLAMA_LOG_INFO("%s: ssm_d_conv            = %u\n",     __func__, hparams.ssm_d_conv);

@@ -2689,12 +2689,18 @@ struct llama_model_qwen35 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
-// Qwen3.5 hybrid trunk with a repeated block and per-sublayer residual stream routers
-struct llama_model_sensenova_loop : public llama_model_qwen35 {
-    llama_model_sensenova_loop(const struct llama_model_params & params) : llama_model_qwen35(params) {}
+// Qwen3.5 hybrid trunk with looped layers and per-sublayer mHC residual stream routers
+struct llama_model_sensenova_loop : public llama_model_base {
+    llama_model_sensenova_loop(const struct llama_model_params & params) : llama_model_base(params) {}
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    // physical layer run by each block
+    std::vector<uint32_t> layer_phys;
+
+    // the tensors are named by physical layer instead of by block
+    bool phys_names = false;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
@@ -2726,10 +2732,6 @@ struct llama_model_sensenova_loop : public llama_model_qwen35 {
                             int   il);
 
         const llama_model & model;
-    };
-
-    struct graph_mtp : public llm_graph_context {
-        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

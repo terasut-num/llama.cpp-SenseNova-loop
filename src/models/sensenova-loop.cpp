@@ -1,196 +1,263 @@
 #include "models.h"
-#include "llama-memory-recurrent.h"
+
+// SenseNova-Loop: a Qwen3.5 hybrid trunk that runs its middle layers several times. Inside the looped
+// layers the residual is two streams, and each sublayer has a mHC router that mixes them.
+//
+// Each visit of a layer is a block of its own, so each visit has its own KV cache and recurrent state.
+// The GGUF files in use come in three layouts:
+//   - sensenova_loop + mhc.layer_kinds: one block per visit, repeated visits can omit their tensors
+//   - sensenova_loop + loop_start/loop_end: one block per visit, all visits have tensors
+//   - qwen35 + loop_start/loop_end: one block per physical layer
+
+static bool sensenova_loop_enters(uint32_t kind) { return kind == 1 || kind == 3; }
+static bool sensenova_loop_leaves(uint32_t kind) { return kind == 2 || kind == 3; }
 
 void llama_model_sensenova_loop::load_arch_hparams(llama_model_loader & ml) {
-    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-    ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
+    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
+    ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
 
-    // Load linear attention (gated delta net) parameters
+    // gated delta net
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
     ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
     ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
-    // Mark recurrent layers (linear attention layers). MTP layers are dense
-    // attention-only and must be flagged non-recurrent.
-    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
-        uint32_t full_attn_interval = 4;
-        ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
-        for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
-            hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
-        }
+    if (hparams.n_layer_nextn != 0) {
+        throw std::runtime_error("sensenova_loop: MTP layers are not supported");
     }
 
-    // sense nova loop: the file holds one block per visit, plus the residual stream routers
-    ml.get_key(LLM_KV_MHC_STREAMS, hparams.n_mhc_streams, false);
-    if (hparams.n_mhc_streams > 0) {
-        if (!ml.get_key_or_arr(LLM_KV_MHC_LAYER_KINDS, hparams.mhc_layer_kinds, hparams.n_layer_all, false)) {
-            throw std::runtime_error("mHC streams are declared but the per layer kinds are missing");
+    const uint32_t n_block = hparams.n_layer_all;
+
+    uint32_t full_attn_interval = 4;
+    ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+    const bool has_recr = ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, n_block, false);
+
+    std::fill(hparams.mhc_layer_kinds.begin(), hparams.mhc_layer_kinds.end(), 0);
+
+    uint32_t loop_start = 0;
+    uint32_t n_phys     = n_block;
+
+    layer_phys.clear();
+
+    if (ml.get_key(LLM_KV_LOOP_START, loop_start, false)) {
+        uint32_t loop_end = 0;
+        uint32_t n_loops  = 0;
+        ml.get_key(LLM_KV_LOOP_END, loop_end);
+        if (!ml.get_key(LLM_KV_NUM_LOOPS, n_loops, false)) {
+            ml.get_key(LLM_KV_LOOP_COUNT, n_loops);
+        }
+        ml.get_key(LLM_KV_PHYSICAL_LAYER_COUNT, n_phys, false);
+
+        if (loop_start >= loop_end || loop_end > n_phys || n_loops < 1) {
+            throw std::runtime_error(format("sensenova_loop: invalid loop %u..%u x %u over %u layers", loop_start, loop_end, n_loops, n_phys));
         }
 
-        // the loop block is stored once and re-entered: the second visit owns no tensors of its
-        // own, so blocks at or past its start read the first visit's weights
-        uint32_t first_enter = UINT32_MAX;
-        uint32_t n_enter     = 0;
-        for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
-            if (hparams.mhc_layer_kinds[i] == 1) {
-                if (n_enter == 0) {
-                    first_enter = i;
-                } else if (n_enter == 1) {
-                    hparams.mhc_loop_start2 = i;
-                    hparams.mhc_loop_shift  = i - first_enter;
-                    break;
-                    LLAMA_LOG_INFO("sensenova: loop start2=%u shift=%u\n", hparams.mhc_loop_start2, hparams.mhc_loop_shift);
-                }
-                ++n_enter;
+        for (uint32_t p = 0; p < loop_start; ++p) {
+            layer_phys.push_back(p);
+        }
+        for (uint32_t i = 0; i < n_loops; ++i) {
+            for (uint32_t p = loop_start; p < loop_end; ++p) {
+                layer_phys.push_back(p);
             }
         }
+        for (uint32_t p = loop_end; p < n_phys; ++p) {
+            layer_phys.push_back(p);
+        }
+
+        const uint32_t n_visit = layer_phys.size();
+        if (n_visit > LLAMA_MAX_LAYERS) {
+            throw std::runtime_error(format("sensenova_loop: %u layer visits exceed the limit of %d", n_visit, LLAMA_MAX_LAYERS));
+        }
+
+        if (n_block == n_visit) {
+            phys_names = false;
+        } else if (n_block == n_phys) {
+            phys_names = true;
+        } else {
+            throw std::runtime_error(format("sensenova_loop: block count %u matches neither %u layers nor %u visits", n_block, n_phys, n_visit));
+        }
+
+        if (!ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.n_mhc_streams, false)) {
+            ml.get_key(LLM_KV_MHC_STREAMS_COUNT, hparams.n_mhc_streams, false);
+        }
+        if (!ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.n_mhc_iters, false)) {
+            ml.get_key(LLM_KV_MHC_ITERATIONS, hparams.n_mhc_iters, false);
+        }
+        ml.get_key(LLM_KV_MHC_PRE_SCALE, hparams.f_mhc_pre_scale, false);
+
+        // the routers cover the looped layers, each pass enters and leaves the streams
+        if (hparams.n_mhc_streams > 0) {
+            const auto inside = [&](uint32_t p) { return p >= loop_start && p < loop_end; };
+            for (uint32_t v = 0; v < n_visit; ++v) {
+                const uint32_t p = layer_phys[v];
+                if (!inside(p)) {
+                    continue;
+                }
+                const bool enters = v == 0           || !inside(layer_phys[v - 1]) || layer_phys[v - 1] >= p;
+                const bool leaves = v + 1 == n_visit || !inside(layer_phys[v + 1]) || layer_phys[v + 1] <= p;
+                hparams.mhc_layer_kinds[v] = enters ? (leaves ? 3 : 1) : (leaves ? 2 : 4);
+            }
+        }
+
+        if (phys_names) {
+            // the per-layer hparams were read for the physical layers, lay them out per visit
+            const auto per_visit = [&](std::array<uint32_t, LLAMA_MAX_LAYERS> & arr) {
+                const auto src = arr;
+                for (uint32_t v = 0; v < n_visit; ++v) {
+                    arr[v] = src[layer_phys[v]];
+                }
+            };
+            per_visit(hparams.n_head_arr);
+            per_visit(hparams.n_head_kv_arr);
+            per_visit(hparams.n_ff_arr);
+            per_visit(hparams.is_recr_impl);
+            hparams.n_layer_all = n_visit;
+        }
+    } else {
+        ml.get_key(LLM_KV_MHC_STREAMS, hparams.n_mhc_streams, false);
+        ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.n_mhc_iters, false);
+        if (hparams.n_mhc_streams > 0) {
+            ml.get_key_or_arr(LLM_KV_MHC_LAYER_KINDS, hparams.mhc_layer_kinds, n_block, true);
+        }
+
+        // the first pass through the streams is the looped block, the passes after it repeat it
+        int first = -1;
+        int len   = 0;
+        for (int v = 0; v < (int) n_block && len == 0; ++v) {
+            if (first < 0 && sensenova_loop_enters(hparams.mhc_layer_kinds[v])) {
+                first = v;
+            }
+            if (first >= 0 && sensenova_loop_leaves(hparams.mhc_layer_kinds[v])) {
+                len = v - first + 1;
+            }
+        }
+        int n_pass = len > 0 ? 1 : 0;
+        while (len > 0 && first + (n_pass + 1)*len <= (int) n_block && sensenova_loop_enters(hparams.mhc_layer_kinds[first + n_pass*len])) {
+            ++n_pass;
+        }
+
+        for (int v = 0; v < (int) n_block; ++v) {
+            if (n_pass < 2 || v < first + len) {
+                layer_phys.push_back(v);
+            } else if (v < first + n_pass*len) {
+                layer_phys.push_back(first + (v - first) % len);
+            } else {
+                layer_phys.push_back(v - (n_pass - 1)*len);
+            }
+        }
+        n_phys = layer_phys.back() + 1;
     }
 
-    switch (hparams.n_layer()) {
-        case 24: type = hparams.n_embd == 1024 ? LLM_TYPE_0_8B : LLM_TYPE_2B; break;
-        case 32: type = hparams.n_embd == 2560 ? LLM_TYPE_4B : LLM_TYPE_9B; break;
-        case 56: type = LLM_TYPE_9B; break;
-        case 64: type = LLM_TYPE_27B; break;
-        default: type = LLM_TYPE_UNKNOWN;
+    if (!has_recr) {
+        for (uint32_t v = 0; v < hparams.n_layer_all; ++v) {
+            hparams.is_recr_impl[v] = (layer_phys[v] + 1) % full_attn_interval != 0;
+        }
     }
+
+    if (hparams.n_mhc_streams != 0 && hparams.n_mhc_streams != 2) {
+        throw std::runtime_error(format("sensenova_loop: %u mHC streams are not supported, only 2", hparams.n_mhc_streams));
+    }
+    if (hparams.n_mhc_iters < 1) {
+        throw std::runtime_error("sensenova_loop: invalid number of sinkhorn iterations");
+    }
+
+    LLAMA_LOG_INFO("%s: %u layers run as %u blocks, %u mHC streams, %u sinkhorn iterations\n", __func__,
+            n_phys, hparams.n_layer_all, hparams.n_mhc_streams, hparams.n_mhc_iters);
+
+    type = hparams.n_embd == 4096 ? LLM_TYPE_9B : LLM_TYPE_UNKNOWN;
 }
 
 void llama_model_sensenova_loop::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const auto nf = nextn_flags(ml);
-    const int trunk_flags = nf.trunk;
-    const int mtp_flags   = nf.mtp;
-
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-
-    // optional projection of the embeddings output
-    cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_embd_out() }, TENSOR_NOT_REQUIRED);
-    cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { hparams.n_embd_out() },         TENSOR_NOT_REQUIRED);
+    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
-    auto load_block_trunk = [&](int il, int flags) {
-        auto & layer = layers[il];
+    const int64_t head_k_dim = hparams.ssm_d_state;
+    const int64_t head_v_dim = hparams.ssm_d_state;
+    const int64_t n_k_heads  = hparams.ssm_n_group;
+    const int64_t n_v_heads  = hparams.ssm_dt_rank;
+    const int64_t key_dim    = head_k_dim * n_k_heads;
+    const int64_t value_dim  = head_v_dim * n_v_heads;
+    const int64_t conv_dim   = key_dim * 2 + value_dim;
 
-        // Calculate dimensions from hyperparameters
-        const int64_t head_k_dim = hparams.ssm_d_state;
-        const int64_t head_v_dim = hparams.ssm_d_state;
-        const int64_t n_k_heads  = hparams.ssm_n_group;
-        const int64_t n_v_heads  = hparams.ssm_dt_rank;
-        const int64_t key_dim    = head_k_dim * n_k_heads;
-        const int64_t value_dim  = head_v_dim * n_v_heads;
-        const int64_t conv_dim   = key_dim * 2 + value_dim;
+    const int64_t n_str    = hparams.n_mhc_streams;
+    const int64_t n_logits = 2*n_str + n_str*n_str;
 
-        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, flags);
-        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, flags);
-
-        if (!hparams.is_recr(il)) {
-            // Attention layers
-            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
-            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
-
-            // Q/K normalization for attention layers
-            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
-            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
-        } else {
-            // Linear attention (gated delta net) specific tensors
-            // Create tensors with calculated dimensions
-            layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
-            layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
-            layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
-            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
-            layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
-            layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", il), { n_embd, n_v_heads }, flags);
-            layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
-            layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", il), { head_v_dim }, flags);
-            layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
-        }
-
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
+    const auto has_tensor = [&](const LLM_TN_IMPL & name) {
+        return ml.get_tensor_meta(name.str().c_str()) != nullptr;
     };
 
-    auto load_block_mtp = [&](int il) {
-        auto & layer = layers[il];
+    // block of the first visit of each physical layer
+    std::vector<int> first_block(*std::max_element(layer_phys.begin(), layer_phys.end()) + 1, -1);
 
-        // MTP block looks like a full-attention Qwen3.5 decoder block.
-        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, mtp_flags);
-        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, mtp_flags);
+    for (int il = 0; il < n_layer; ++il) {
+        const int phys = layer_phys[il];
+        const int bid  = phys_names ? phys : il;
 
-        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
-        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, mtp_flags);
-        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
-        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
-
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, mtp_flags);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, mtp_flags);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, mtp_flags);
-
-        // NextN-specific tensors that define the MTP block.
-        layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, mtp_flags);
-        layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", il), { n_embd },              mtp_flags);
-        layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", il), { n_embd },              mtp_flags);
-        layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
-    };
-
-    // the looped block is stored once and executed twice: the second visit's blocks own no
-    // tensors, they alias the first visit's (see the copy at the end of this function)
-    LLAMA_LOG_INFO("sensenova tensors: loop_lo=%u shift=%u (kinds0=%u)\n", hparams.mhc_loop_start2, hparams.mhc_loop_shift, hparams.mhc_layer_kinds[4]);
-    const int loop_lo = (int) hparams.mhc_loop_start2;
-    const int loop_hi = (int) (hparams.mhc_loop_start2 + hparams.mhc_loop_shift);
-
-    for (int i = 0; i < n_layer; ++i) {
-        if (i >= loop_lo && i < loop_hi) {
+        // a repeated visit without tensors of its own runs the weights of the first visit
+        if (first_block[phys] >= 0 && (phys_names || !has_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", il)))) {
+            layers[il] = layers[first_block[phys]];
             continue;
         }
-        load_block_trunk(i, trunk_flags);
-    }
-    for (int i = n_layer; i < n_layer_all; ++i) {
-        load_block_mtp(i);
-    }
-
-    // residual stream routers: one per sublayer on every block that carries mHC
-    if (hparams.n_mhc_streams > 0) {
-        const int64_t n_str    = hparams.n_mhc_streams;
-        const int64_t n_logits = 2*n_str + n_str*n_str;
-
-        for (int il = 0; il < n_layer; ++il) {
-            if (hparams.mhc_layer_kinds[il] == 0 || (il >= loop_lo && il < loop_hi)) {
-                continue;
-            }
-            auto & layer = layers[il];
-            layer.mhc_attn_w = create_tensor(tn(LLM_TENSOR_MHC_ATTN_W, il), { n_str*n_embd, n_logits }, 0);
-            layer.mhc_attn_b = create_tensor(tn(LLM_TENSOR_MHC_ATTN_B, il), { n_logits },               0);
-            layer.mhc_ffn_w  = create_tensor(tn(LLM_TENSOR_MHC_FFN_W,  il), { n_str*n_embd, n_logits }, 0);
-            layer.mhc_ffn_b  = create_tensor(tn(LLM_TENSOR_MHC_FFN_B,  il), { n_logits },               0);
+        if (first_block[phys] < 0) {
+            first_block[phys] = il;
         }
-    }
 
-    // a re-entered loop block reuses the first visit's weights, byte for byte: point its layer
-    // record at the same tensors instead of loading a second copy (8.82 GB -> 5.75 GB
-    // for Q4_K_M at 56 stored blocks)
-    for (int i = loop_lo; i < loop_hi; ++i) {
-        layers[i] = layers[i - (int) hparams.mhc_loop_shift];
+        auto & layer = layers[il];
+
+        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", bid), { n_embd }, 0);
+        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", bid), { n_embd }, 0);
+
+        if (!hparams.is_recr(il)) {
+            create_tensor_qkv(layer, bid, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, 0);
+            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", bid), { n_embd_head_k * n_head, n_embd }, 0);
+
+            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", bid), { n_embd_head_k }, 0);
+            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", bid), { n_embd_head_k }, 0);
+        } else {
+            layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", bid), { n_embd, key_dim * 2 + value_dim }, 0);
+            layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", bid), { n_embd, value_dim }, 0);
+            layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", bid), { hparams.ssm_d_conv, conv_dim }, 0);
+            layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   bid), { hparams.ssm_dt_rank }, 0);
+            layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         bid), { hparams.ssm_dt_rank }, 0);
+            layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", bid), { n_embd, n_v_heads }, 0);
+            layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", bid), { n_embd, n_v_heads }, 0);
+            layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", bid), { head_v_dim }, 0);
+            layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", bid), { value_dim, n_embd }, 0);
+        }
+
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", bid), { n_embd, n_ff }, 0);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", bid), { n_ff, n_embd }, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", bid), { n_embd, n_ff }, 0);
+
+        if (hparams.mhc_layer_kinds[il] != 0) {
+            // the notfakerv layout stores the routers under the hc_*_fn / hc_*_base names
+            if (has_tensor(tn(LLM_TENSOR_HC_ATTN_FN, "weight", bid))) {
+                layer.mhc_attn_w = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,   "weight", bid), { n_str*n_embd, n_logits }, 0);
+                layer.mhc_attn_b = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE, "bias",   bid), { n_logits }, 0);
+                layer.mhc_ffn_w  = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,    "weight", bid), { n_str*n_embd, n_logits }, 0);
+                layer.mhc_ffn_b  = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,  "bias",   bid), { n_logits }, 0);
+            } else {
+                layer.mhc_attn_w = create_tensor(tn(LLM_TENSOR_MHC_ATTN_W, bid), { n_str*n_embd, n_logits }, 0);
+                layer.mhc_attn_b = create_tensor(tn(LLM_TENSOR_MHC_ATTN_B, bid), { n_logits }, 0);
+                layer.mhc_ffn_w  = create_tensor(tn(LLM_TENSOR_MHC_FFN_W,  bid), { n_str*n_embd, n_logits }, 0);
+                layer.mhc_ffn_b  = create_tensor(tn(LLM_TENSOR_MHC_FFN_B,  bid), { n_logits }, 0);
+            }
+        }
     }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_sensenova_loop::build_arch_graph(const llm_graph_params & params) const {
-    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        return std::make_unique<graph_mtp>(*this, params);
-    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -215,61 +282,53 @@ llama_model_sensenova_loop::graph::graph(const llama_model & model, const llm_gr
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // sense nova loop, expanded: the looped block appears once per visit, so a plain sequential
-    // pass is exact. Inside the mHC range the residual is two streams and every sublayer routes.
-    const int64_t n_str_mhc = hparams.n_mhc_streams;
+    // inside the mHC range the residual is two streams: the two halves of the last merge output
+    ggml_tensor * str_a = nullptr;
+    ggml_tensor * str_b = nullptr;
 
-    ggml_tensor * str_a = nullptr;   // stream 0
-    ggml_tensor * str_b = nullptr;   // stream 1
+    // route the streams into the sublayer input, run the sublayer, merge its output back into the streams
+    auto build_mhc_sublayer = [&](ggml_tensor * w, ggml_tensor * bias, ggml_tensor * norm_w, bool is_attn, int il) {
+        const int64_t d = str_a->ne[0];
 
-    // one sublayer inside the streams: route, run the sublayer on the pre-weighted sum, mix back.
-    // both halves are single fused ops (ggml_mhc_route / ggml_mhc_merge), so a router costs one node
-    // instead of a hundred: there are 96 of them per token.
-    auto build_mhc_sublayer = [&](ggml_tensor * a, ggml_tensor * b,
-                                  ggml_tensor * w, ggml_tensor * bias,
-                                  ggml_tensor * norm_w, int il, bool is_attn,
-                                  ggml_tensor ** out_a, ggml_tensor ** out_b) {
-        const int64_t d = a->ne[0];
+        ggml_tensor * packed = ggml_mhc_route(ctx0, str_a, str_b, w, bias, hparams.n_mhc_iters);
+        cb(packed, is_attn ? "mhc_attn_route" : "mhc_ffn_route", il);
 
-        ggml_tensor * packed = ggml_mhc_route(ctx0, a, b, w, bias, 20);
-        cb(packed, is_attn ? "mhc_attn_packed" : "mhc_ffn_packed", il);
-
-        ggml_tensor * branch = ggml_view_3d(ctx0, packed, d, packed->ne[1], packed->ne[2],
-                packed->nb[1], packed->nb[2], 0);
-
-        ggml_tensor * x = build_norm(branch, norm_w, nullptr, LLM_NORM_RMS, il);
-        cb(x, is_attn ? "mhc_attn_norm" : "mhc_ffn_norm", il);
-
-        if (is_attn) {
-            if (hparams.is_recr(il)) {
-                x = build_layer_attn_linear(inp->get_recr(), x, il);
-            } else {
-                x = build_layer_attn(inp->get_attn(), x, inp_pos, sections, il);
-            }
-        } else {
-            x = build_layer_ffn(x, il);
+        ggml_tensor * x = ggml_view_2d(ctx0, packed, d, n_tokens, packed->nb[1], 0);
+        if (hparams.f_mhc_pre_scale != 1.0f) {
+            x = ggml_scale(ctx0, ggml_cont(ctx0, x), hparams.f_mhc_pre_scale);
         }
-        cb(x, is_attn ? "mhc_attn_out" : "mhc_ffn_out", il);
 
-        ggml_tensor * merged = ggml_mhc_merge(ctx0, a, b, x, packed);
-        cb(merged, is_attn ? "mhc_attn_merged" : "mhc_ffn_merged", il);
+        x = build_norm(x, norm_w, nullptr, LLM_NORM_RMS, il);
+        cb(x, is_attn ? "attn_norm" : "attn_post_norm", il);
 
-        *out_a = ggml_view_3d(ctx0, merged, d, merged->ne[1], merged->ne[2],
-                merged->nb[1], merged->nb[2], 0);
-        *out_b = ggml_view_3d(ctx0, merged, d, merged->ne[1], merged->ne[2],
-                merged->nb[1], merged->nb[2], (size_t) d*merged->nb[0]);
+        if (!is_attn) {
+            x = build_layer_ffn(x, il);
+        } else if (hparams.is_recr(il)) {
+            x = build_layer_attn_linear(inp->get_recr(), x, il);
+        } else {
+            x = build_layer_attn(inp->get_attn(), x, inp_pos, sections, il);
+        }
+
+        ggml_tensor * merged = ggml_mhc_merge(ctx0, str_a, str_b, x, packed);
+        cb(merged, is_attn ? "mhc_attn_merge" : "mhc_ffn_merge", il);
+
+        str_a = ggml_view_2d(ctx0, merged, d, n_tokens, merged->nb[1], 0);
+        str_b = ggml_view_2d(ctx0, merged, d, n_tokens, merged->nb[1], d*merged->nb[0]);
     };
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = inpL;
+        const auto & layer = model.layers[il];
 
         const uint32_t mhc_kind = hparams.n_mhc_streams > 0 ? hparams.mhc_layer_kinds[il] : 0;
 
         if (mhc_kind == 0) {
+            res->t_layer_inp[il] = inpL;
+
             ggml_tensor * inpSA = inpL;
 
-            cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            cur = build_norm(inpL, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
             cb(cur, "attn_norm", il);
+
             ggml_build_forward_expand(gf, cur);
 
             if (hparams.is_recr(il)) {
@@ -287,7 +346,7 @@ llama_model_sensenova_loop::graph::graph(const llama_model & model, const llm_gr
             cb(cur, "attn_residual", il);
 
             ggml_tensor * ffn_residual = cur;
-            ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+            ggml_tensor * attn_post_norm = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
             cb(attn_post_norm, "attn_post_norm", il);
 
             cur = build_layer_ffn(attn_post_norm, il);
@@ -300,42 +359,41 @@ llama_model_sensenova_loop::graph::graph(const llama_model & model, const llm_gr
             cb(cur, "l_out", il);
 
             inpL = cur;
-            str_a = str_b = nullptr;
             continue;
         }
 
-        // entering the mHC range: both streams start equal to the single residual
-        if (mhc_kind == 1 || str_a == nullptr) {
+        // entering the mHC range: both streams start as the single residual
+        if (sensenova_loop_enters(mhc_kind)) {
             str_a = inpL;
             str_b = inpL;
         }
+        GGML_ASSERT(str_a != nullptr && "sensenova_loop: mHC block without streams");
 
-        ggml_build_forward_expand(gf, str_a);
+        // inside the streams the first one stands in for the layer input
+        res->t_layer_inp[il] = str_a;
 
-        ggml_tensor * a0 = nullptr; ggml_tensor * b0 = nullptr;
-        build_mhc_sublayer(str_a, str_b, model.layers[il].mhc_attn_w, model.layers[il].mhc_attn_b,
-                model.layers[il].attn_norm, il, true, &a0, &b0);
+        build_mhc_sublayer(layer.mhc_attn_w, layer.mhc_attn_b, layer.attn_norm,      true,  il);
+        build_mhc_sublayer(layer.mhc_ffn_w,  layer.mhc_ffn_b,  layer.attn_post_norm, false, il);
 
-        ggml_tensor * a1 = nullptr; ggml_tensor * b1 = nullptr;
-        build_mhc_sublayer(a0, b0, model.layers[il].mhc_ffn_w, model.layers[il].mhc_ffn_b,
-                model.layers[il].attn_post_norm, il, false, &a1, &b1);
-
-        if (mhc_kind == 2) {
-            // leaving the mHC range: average the streams back to one residual
-            cur = ggml_scale(ctx0, ggml_add(ctx0, a1, b1), 0.5f);
+        // leaving the mHC range: the residual is the mean of the streams
+        if (sensenova_loop_leaves(mhc_kind)) {
+            cur = ggml_scale(ctx0, ggml_add(ctx0, str_a, str_b), 0.5f);
             cb(cur, "mhc_leave", il);
-            str_a = str_b = nullptr;
-        } else {
-            cur = a1;
-            str_a = a1;
-            str_b = b1;
+
+            if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
+                cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+            }
+
+            cur = build_cvec(cur, il);
+            cb(cur, "l_out", il);
+
+            inpL  = cur;
+            str_a = nullptr;
+            str_b = nullptr;
         }
-
-        cur = build_cvec(cur, il);
-        cb(cur, "l_out", il);
-
-        inpL = cur;
     }
+    GGML_ASSERT(str_a == nullptr && "sensenova_loop: the last block must leave the mHC streams");
+
     cur = inpL;
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
@@ -349,16 +407,6 @@ llama_model_sensenova_loop::graph::graph(const llama_model & model, const llm_gr
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
-
-    if (model.cls_out) {
-        ggml_tensor * embd = build_lora_mm(model.cls_out, cur);
-        if (model.cls_out_b) {
-            embd = ggml_add(ctx0, embd, model.cls_out_b);
-        }
-        cb(embd, "result_embd_proj", -1);
-        res->t_embd = embd;
-        ggml_build_forward_expand(gf, embd);
-    }
 
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);
@@ -620,175 +668,4 @@ ggml_tensor * llama_model_sensenova_loop::graph::build_layer_ffn(ggml_tensor * c
     cb(cur, "ffn_out", il);
 
     return cur;
-}
-
-// LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 dense series
-llama_model_sensenova_loop::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
-    : llm_graph_context(params) {
-    GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35 MTP requires n_layer_nextn > 0");
-    GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN35 MTP currently only supports a single MTP block");
-
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-
-    // hparams.n_layer includes both main model layers and MTP layers. The MTP
-    // layer is stored immediately after the main layers in model.layers[].
-    const int il = hparams.n_layer();
-    const auto & layer = model.layers[il];
-
-    GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
-    GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
-    GGML_ASSERT(layer.nextn.hnorm   && "MTP block missing nextn.hnorm");
-
-    int sections[4];
-    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
-
-    // TODO: extract in a common llm_graph_context::build_inp_embd_h()
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
-
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp->tokens);
-
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
-    ggml_set_input(inp->embd);
-
-    // TODO: make static using `ggml_build_forward_select()`
-    //       see llm_graph_context::build_inp_embd() for reference
-    ggml_tensor * tok_embd;
-    ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.token) {
-        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-
-        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
-
-        // a Hadamard-latent table stores rotated rows; restore the primal basis
-        if (hdmd) {
-            if (const auto it = hdmd->inv.find(tok_embd_w); it != hdmd->inv.end()) {
-                tok_embd = llama_mul_mat_hadamard(ctx0, tok_embd, it->second.rot);
-                if (it->second.signs) {
-                    tok_embd = ggml_mul(ctx0, tok_embd, it->second.signs);
-                }
-            }
-        }
-    } else {
-        tok_embd = inp->embd;
-    }
-    cb(tok_embd, "mtp_tok_embd", il);
-
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
-
-    ggml_tensor * h_embd = inp->h;
-
-    res->add_input(std::move(inp));
-
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
-
-    auto * inp_attn = build_attn_inp_kv();
-
-    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
-    cb(h_norm, "mtp_hnorm", il);
-
-    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
-    cb(e_norm, "mtp_enorm", il);
-
-    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
-    cb(concat, "mtp_concat", il);
-
-    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
-    cb(cur, "mtp_eh_proj", il);
-
-    ggml_tensor * inpSA = cur;
-
-    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
-    cb(cur, "mtp_attn_norm", il);
-
-    auto [Qcur_full, Kcur, Vcur] = build_qkv(layer, cur,
-            n_embd_head * 2, n_head,
-            n_embd_head,     n_head_kv,
-            n_embd_head,     n_head_kv,
-            il, false);
-    cb(Qcur_full, "mtp_Qcur_full", il);
-
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full,
-            n_embd_head, n_head, n_tokens,
-            ggml_element_size(Qcur_full) * n_embd_head * 2,
-            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-            0);
-    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Qcur, "mtp_Qcur_normed", il);
-
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full,
-            n_embd_head, n_head, n_tokens,
-            ggml_element_size(Qcur_full) * n_embd_head * 2,
-            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-            ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
-    cb(gate, "mtp_gate", il);
-
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Kcur, "mtp_Kcur_normed", il);
-
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-    cb(Vcur, "mtp_Vcur", il);
-
-    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-
-    const float kq_scale = hparams.f_attention_scale == 0.0f
-            ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
-
-    cur = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-    cb(cur, "mtp_attn_pregate", il);
-
-    cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
-    cur = build_lora_mm(layer.wo, cur, layer.wo_s);
-    cb(cur, "mtp_attn_out", il);
-
-    cur = ggml_add(ctx0, cur, inpSA);
-    cb(cur, "mtp_attn_residual", il);
-
-    ggml_tensor * ffn_residual = cur;
-    cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
-    cb(cur, "mtp_attn_post_norm", il);
-
-    cur = build_ffn(cur,
-            layer.ffn_up,   nullptr, layer.ffn_up_s,
-            layer.ffn_gate, nullptr, layer.ffn_gate_s,
-            layer.ffn_down, nullptr, layer.ffn_down_s,
-            nullptr,
-            LLM_FFN_SILU, LLM_FFN_PAR, il);
-    cb(cur, "mtp_ffn_out", il);
-
-    cur = ggml_add(ctx0, cur, ffn_residual);
-    cb(cur, "mtp_post_ffn", il);
-
-    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
-            ? layer.nextn.shared_head_norm
-            : model.output_norm;
-    GGML_ASSERT(head_norm_w && "QWEN35 MTP: missing both nextn.shared_head_norm and output_norm");
-    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
-
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
-
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    cb(cur, "mtp_shared_head_norm", -1);
-
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-    GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
-    cb(cur, "result_output", -1);
-
-    res->t_logits = cur;
 }

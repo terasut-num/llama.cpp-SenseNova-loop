@@ -981,10 +981,6 @@ struct llama_model_base : public llama_model {
     virtual ~llama_model_base() = default;
 
     ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
-    ggml_tensor * create_tensor_impl(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
-
-    // tensors of a re-entered loop block resolve to the first visit's tensors
-    std::unordered_map<std::string, ggml_tensor *> loop_shared;
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
